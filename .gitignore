@@ -1,16 +1,22 @@
 # Environments
 
 # Logs
-logs/
+logs/*
+!logs/.gitkeep
 
 # Caches
-paddlex_cache/
-vllm_cache/
+paddlex_cache/*
+!paddlex_cache/.gitkeep
+vllm_cache/*
+!vllm_cache/.gitkeep
 
 # Data and Models
-model/
-output/
-input/
+model/*
+!model/.gitkeep
+output/*
+!output/.gitkeep
+input/*
+!input/.gitkeep
 
 # Large files / Docker images
 *.tar
