@@ -1,0 +1,21 @@
+# Environments
+.env
+
+# Logs
+logs/
+
+# Caches
+paddlex_cache/
+vllm_cache/
+
+# Data and Models
+model/
+output/
+input/
+
+# Large files / Docker images
+*.tar
+
+# OS generated files
+.DS_Store
+Thumbs.db

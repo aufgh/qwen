@@ -1,0 +1,111 @@
+# =============================================================================
+# Qwen3.5-4B Docker Compose 编排
+# 双容器: vLLM 推理服务器 (GPU) + Qwen 客户端管道
+# =============================================================================
+
+services:
+  # -------------------------------------------------------------------------
+  # Container 1: vLLM 推理服务器
+  # 基于官方 vLLM 镜像, FP8 预量化模型 (Ada Lovelace 硬件加速)
+  # 模型权重挂载自 ./model/
+  # -------------------------------------------------------------------------
+  vllm-server:
+    image: vllm/vllm-openai:latest
+    container_name: qwen-vllm-server
+    command: >
+      --model /workspace/model/${MODEL_DIR:-PaddleOCR-VL-1.6}
+      --max-model-len ${MAX_MODEL_LEN:-16384}
+      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.85}
+      --max-num-seqs ${MAX_NUM_SEQS:-16}
+      --max-num-batched-tokens ${MAX_BATCHED_TOKENS:-4096}
+      --enable-chunked-prefill
+      --enable-prefix-caching
+      --dtype auto
+      --host 0.0.0.0
+      --port 8000
+      --trust-remote-code
+      ${SERVED_MODEL_ARGS:---served-model-name Qwen3.5-4B-AWQ-4bit}
+    volumes:
+      - ./model:/workspace/model:ro
+      - ./vllm_cache:/root/.cache/vllm
+    environment:
+      - TORCHINDUCTOR_CACHE_DIR=/root/.cache/vllm
+      - VLLM_TORCH_COMPILE_CACHE_DIR=/root/.cache/vllm
+    ports:
+      - "8000:8000"
+    ipc: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - qwen-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/v1/models || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 180s
+
+  # -------------------------------------------------------------------------
+  # Container 2: Qwen 客户端 (批处理模式)
+  # 基于 python:3.10-slim, 通过 OpenAI API 调用 vLLM
+  # -------------------------------------------------------------------------
+  qwen-client:
+    build:
+      context: .
+      dockerfile: Dockerfile.qwen-client
+    image: qwen-client:latest
+    container_name: qwen-client
+    command: ["python", "/workspace/scripts/process.py"]
+    volumes:
+      - ./input:/workspace/input
+      - ./${OUTPUT_DIR:-output}:/workspace/output
+      - ./config.yaml:/workspace/config.yaml:ro
+      - ./scripts:/workspace/scripts:ro
+      - ./logs:/workspace/logs
+      - ./paddlex_cache:/root/.paddlex
+    depends_on:
+      vllm-server:
+        condition: service_healthy
+    environment:
+      - VLLM_SERVER_URL=http://vllm-server:8000/v1
+      - PYTHONUNBUFFERED=1
+    networks:
+      - qwen-net
+    restart: "no"
+
+  # -------------------------------------------------------------------------
+  # Container 2 变体: Qwen 客户端 (增量监控模式)
+  # -------------------------------------------------------------------------
+  qwen-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile.qwen-client
+    image: qwen-client:latest
+    container_name: qwen-monitor
+    command: ["python", "/workspace/scripts/monitor.py"]
+    volumes:
+      - ./input:/workspace/input
+      - ./${OUTPUT_DIR:-output}:/workspace/output
+      - ./config.yaml:/workspace/config.yaml:ro
+      - ./scripts:/workspace/scripts:ro
+      - ./logs:/workspace/logs
+      - ./paddlex_cache:/root/.paddlex
+    depends_on:
+      vllm-server:
+        condition: service_healthy
+    environment:
+      - VLLM_SERVER_URL=http://vllm-server:8000/v1
+      - PYTHONUNBUFFERED=1
+    networks:
+      - qwen-net
+    restart: unless-stopped
+
+networks:
+  qwen-net:
+    driver: bridge
