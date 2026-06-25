@@ -261,15 +261,23 @@ def restore_compact_output(data, anchor_map: dict):
         # T 类型叶子节点：原文截取型
         if keys.issubset({"v", "p"}) and "v" in data:
             return {
-                "值": data.get("v"),
+                "状态": data.get("v"),
                 "证据": restore_evidence(data.get("p"), anchor_map),
             }
 
         # J 类型叶子节点：状态判断型
         if keys.issubset({"s", "p"}) and "s" in data:
+            s_val = data.get("s")
+            evidence = restore_evidence(data.get("p"), anchor_map)
+            
+            status_str = status_map.get(s_val, "未提及")
+            # 如果是异常，不仅标记异常，还将原文拼接到状态中
+            if str(s_val) == "1":
+                status_str = f"异常：{evidence}" if evidence else "异常"
+                
             return {
-                "状态": status_map.get(data.get("s"), "未提及"),
-                "证据": restore_evidence(data.get("p"), anchor_map),
+                "状态": status_str,
+                "证据": evidence,
             }
 
         # 普通嵌套对象
