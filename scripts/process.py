@@ -213,24 +213,35 @@ def build_schema_template(extraction: dict) -> str:
 
 
 def restore_evidence(position, anchor_map: dict) -> str | None:
-    """把模型输出的锚点标签（如 <s1> 或 ["<s1>", "<s2>"]）还原为原文证据片段。"""
-    if not position:
+    """把模型输出的锚点区间（如 ["<s1>", "<s5>"]）还原为原文证据片段。"""
+    if not position or not isinstance(position, list) or len(position) != 2:
         return None
+        
+    start_tag, end_tag = position
     
-    if isinstance(position, str):
-        # 兼容模型可能不听话把标签连写成 "<s1><s2>" 的情况
-        import re
-        tags = re.findall(r'<s\d+>', position)
-        if len(tags) > 1:
-            evidences = [anchor_map.get(t) for t in tags if t in anchor_map]
-            return "".join(evidences) if evidences else None
-        return anchor_map.get(position)
+    import re
+    s_match = re.search(r'\d+', str(start_tag))
+    e_match = re.search(r'\d+', str(end_tag))
+    
+    if not s_match or not e_match:
+        return None
         
-    if isinstance(position, list):
-        evidences = [anchor_map.get(str(p)) for p in position if str(p) in anchor_map]
-        return "".join(evidences) if evidences else None
+    try:
+        s_id = int(s_match.group())
+        e_id = int(e_match.group())
+    except ValueError:
+        return None
         
-    return None
+    if s_id > e_id:
+        s_id, e_id = e_id, s_id
+        
+    evidences = []
+    for i in range(s_id, e_id + 1):
+        tag = f"<s{i}>"
+        if tag in anchor_map:
+            evidences.append(anchor_map[tag])
+            
+    return "".join(evidences) if evidences else None
 
 
 def restore_compact_output(data, anchor_map: dict):
