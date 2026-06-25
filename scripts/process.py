@@ -218,6 +218,12 @@ def restore_evidence(position, anchor_map: dict) -> str | None:
         return None
     
     if isinstance(position, str):
+        # 兼容模型可能不听话把标签连写成 "<s1><s2>" 的情况
+        import re
+        tags = re.findall(r'<s\d+>', position)
+        if len(tags) > 1:
+            evidences = [anchor_map.get(t) for t in tags if t in anchor_map]
+            return "".join(evidences) if evidences else None
         return anchor_map.get(position)
         
     if isinstance(position, list):
