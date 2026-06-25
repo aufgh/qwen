@@ -27,6 +27,33 @@ from openai import OpenAI
 from PIL import Image
 from tqdm import tqdm
 
+# =============================================================================
+# 全局时间戳日志拦截器
+# =============================================================================
+import builtins
+import threading
+
+_original_print = builtins.print
+_print_lock = threading.Lock()
+
+def timestamped_print(*args, **kwargs):
+    from datetime import datetime, timezone, timedelta
+    tz_shanghai = timezone(timedelta(hours=8))
+    time_str = datetime.now(tz_shanghai).strftime("[%H:%M:%S]")
+    with _print_lock:
+        if args and isinstance(args[0], str) and args[0].startswith("\n"):
+            # 如果原先是换行打头，则把换行提到时间戳外面，保持版式美观
+            first_arg = args[0][1:]
+            if first_arg:
+                _original_print("\n" + time_str + " " + first_arg, *args[1:], **kwargs)
+            else:
+                _original_print("\n" + time_str, *args[1:], **kwargs)
+        else:
+            _original_print(time_str, *args, **kwargs)
+
+builtins.print = timestamped_print
+
+
 
 # =============================================================================
 # 配置加载
@@ -250,8 +277,6 @@ def extract_structured(
     if not thinking_enabled:
         extra_body["chat_template_kwargs"] = {"enable_thinking": False}
 
-    print("\n[JSON Extraction] 开始流式输出模型思考与提取过程：")
-    print("-" * 50)
     response = client.chat.completions.create(
         model=model_name,
         messages=messages,
@@ -260,17 +285,10 @@ def extract_structured(
         top_p=inference.get("top_p", 0.95),
         presence_penalty=inference.get("presence_penalty", 0.0),
         extra_body=extra_body,
-        stream=True,
+        stream=False,
     )
 
-    raw_response = ""
-    for chunk in response:
-        if chunk.choices and chunk.choices[0].delta.content is not None:
-            content = chunk.choices[0].delta.content
-            print(content, end="", flush=True)
-            raw_response += content
-    print("\n" + "-" * 50)
-    print("[JSON Extraction] 输出完毕。\n")
+    raw_response = response.choices[0].message.content
 
     # 尝试解析 JSON
     try:
@@ -489,7 +507,6 @@ def process_single_file_qwen(
     file_output_dir = output_dir / file_name
     file_output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[PROCESS] 开始处理: {file_path.name} (Qwen)")
     start_time = time.time()
 
     try:
@@ -504,7 +521,6 @@ def process_single_file_qwen(
             f.write("\n")
 
         elapsed = time.time() - start_time
-        print(f"[DONE] {file_path.name} Qwen-VL 处理完成 ({elapsed:.1f}s)")
 
         return {
             "file": file_path.name,
@@ -518,6 +534,7 @@ def process_single_file_qwen(
     except Exception as e:
         elapsed = time.time() - start_time
         print(f"[ERROR] {file_path.name} 处理失败: {e}")
+        import traceback
         traceback.print_exc()
 
         error_file = file_output_dir / "error.txt"
@@ -535,112 +552,7 @@ def process_single_file_qwen(
         }
 
 
-# =============================================================================
-# 单文件处理 (PaddleOCR-VL Pipeline)
-# =============================================================================
 
-def process_single_file_paddleocr(
-    pipeline,
-    file_path: Path,
-    output_dir: Path,
-    config: dict,
-) -> dict:
-    """使用 PaddleOCR-VL Pipeline 处理单个文件（自动版面分析 + OCR）"""
-    file_name = file_path.stem
-    file_output_dir = output_dir / file_name
-    file_output_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"[PROCESS] 开始处理: {file_path.name}")
-    start_time = time.time()
-
-    try:
-        # 提取推理配置
-        inference_cfg = config.get("inference", {})
-        repetition_penalty = float(inference_cfg.get("repetition_penalty", 1.1))
-        temperature = float(inference_cfg.get("temperature", 0.0))
-        top_p = float(inference_cfg.get("top_p", 1.0))
-        
-        # PaddleOCR-VL Pipeline 自动处理：版面检测 → 子区域裁切 → VLM OCR → Markdown 拼接
-        # 并传入重复惩罚等采样参数，防止复读机现象
-        output = pipeline.predict(
-            str(file_path),
-            repetition_penalty=repetition_penalty,
-            temperature=temperature,
-            top_p=top_p
-        )
-        
-        all_ocr_texts = []
-        page_count = 0
-        
-        for res in output:
-            page_count += 1
-            # 从 PaddleOCR 结果中提取 Markdown 文本
-            # PaddleOCR-VL 的 predict 结果对象包含 text 属性
-            if hasattr(res, 'text'):
-                page_text = res.text
-            elif hasattr(res, 'rec_text'):
-                page_text = res.rec_text
-            else:
-                # 尝试通过 save_to_markdown 获取文本
-                import tempfile
-                with tempfile.TemporaryDirectory() as tmpdir:
-                    res.save_to_markdown(save_path=tmpdir)
-                    # 读取生成的 markdown 文件
-                    md_files = list(Path(tmpdir).rglob("*.md"))
-                    if md_files:
-                        page_text = md_files[0].read_text(encoding="utf-8")
-                    else:
-                        page_text = str(res)
-            
-            all_ocr_texts.append(page_text)
-            
-            # 也让 PaddleOCR 保存原始结果到单文件输出目录
-            try:
-                res.save_to_json(save_path=str(file_output_dir))
-                res.save_to_markdown(save_path=str(file_output_dir))
-            except Exception as save_err:
-                print(f"  [WARN] 保存 PaddleOCR 原始结果失败: {save_err}")
-
-        # 保存合并的单文件结果 (ocr_result.md)
-        combined_ocr = "\n\n---\n\n".join(all_ocr_texts)
-        combined_ocr_path = file_output_dir / "ocr_result.md"
-        with open(combined_ocr_path, "w", encoding="utf-8") as f:
-            f.write(f"# OCR 完整结果 - {file_path.name}\n\n")
-            f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write(f"总页数: {page_count}\n\n---\n\n")
-            f.write(combined_ocr)
-            f.write("\n")
-
-        elapsed = time.time() - start_time
-        print(f"[DONE] {file_path.name} PaddleOCR-VL 处理完成 ({elapsed:.1f}s)")
-
-        return {
-            "file": file_path.name,
-            "status": "success",
-            "pages": page_count,
-            "elapsed_seconds": round(elapsed, 1),
-            "output_dir": str(file_output_dir),
-            "ocr_text": combined_ocr,
-        }
-
-    except Exception as e:
-        elapsed = time.time() - start_time
-        print(f"[ERROR] {file_path.name} 处理失败: {e}")
-        traceback.print_exc()
-
-        error_file = file_output_dir / "error.txt"
-        with open(error_file, "w", encoding="utf-8") as f:
-            f.write(f"文件: {file_path.name}\n")
-            f.write(f"时间: {datetime.now().isoformat()}\n")
-            f.write(f"错误: {str(e)}\n")
-            f.write(f"详情:\n{traceback.format_exc()}\n")
-
-        return {
-            "file": file_path.name,
-            "status": "error",
-            "error": str(e),
-            "elapsed_seconds": round(elapsed, 1),
-        }
 
 
 # =============================================================================
@@ -707,11 +619,16 @@ def merge_results(client: OpenAI, model_name: str, config: dict, output_dir: Pat
         global_structured = None
         
         if extraction_config.get("enabled", True) and full_text.strip():
-            print(f"[MERGE] 进行全局结构化抽取 (总文字长度: {len(full_text)} 字符)...")
+            grp_name = output_dir.name
+            print(f"\n[后台任务] 开始对 {grp_name} 进行全局 JSON 抽取 (文本长度: {len(full_text)} 字)...")
+            start_ext = time.time()
             try:
                 global_structured = extract_structured(client, model_name, full_text, config)
+                ext_time = time.time() - start_ext
+                print(f"\n[后台任务] ✅ {grp_name} 的 JSON 抽取成功！(耗时: {ext_time:.1f} 秒)")
             except Exception as e:
-                print(f"[ERROR] 全局结构化抽取失败: {e}")
+                ext_time = time.time() - start_ext
+                print(f"\n[后台任务] ❌ {grp_name} 的 JSON 抽取失败: {e} (耗时: {ext_time:.1f} 秒)")
                 global_structured = {"_error": str(e), "_text_length": len(full_text)}
 
         # 直接将干净的结构化 JSON 写入文件，不添加多余包裹信息
@@ -725,25 +642,7 @@ def merge_results(client: OpenAI, model_name: str, config: dict, output_dir: Pat
 
         print(f"[MERGE] 全局抽取 JSON 结果已保存至: {merged_json}")
 
-    # 3. 摘要报告
-    summary_path = merged_dir / "summary.json"
-    summary = {
-        "generated_at": datetime.now().isoformat(),
-        "total_files": len(results),
-        "success_count": sum(1 for r in results if r["status"] == "success"),
-        "error_count": sum(1 for r in results if r["status"] == "error"),
-        "files": [
-            {
-                "file": r["file"],
-                "status": r["status"],
-                "pages": r.get("pages", 0),
-                "elapsed_seconds": r.get("elapsed_seconds", 0),
-            }
-            for r in results
-        ],
-    }
-    with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+
 
     print(f"[MERGE] 批处理摘要: {summary_path}")
 
@@ -801,99 +700,60 @@ def wait_for_vlm_server(server_url: str, max_retries: int = 30, interval: int = 
 # 图像预处理 (OpenCV)
 # =============================================================================
 
-def preprocess_images_with_opencv(files: list, temp_dir: Path) -> list:
-    """使用 OpenCV 处理图片流水线：增强对比度 + 去除非文字边缘"""
+def preprocess_single_image(file_path: Path, temp_dir: Path) -> Path:
+    """流水线化的 OpenCV 预处理。每个 CPU 线程只处理自己分发到的单张图片。"""
     import cv2
     import numpy as np
-    import shutil
-
-    if temp_dir.exists():
-        shutil.rmtree(str(temp_dir))
-    temp_dir.mkdir(parents=True, exist_ok=True)
     
-    processed_files = []
+    if file_path.suffix.lower() == ".pdf":
+        return file_path
+        
+    img = cv2.imread(str(file_path))
+    if img is None:
+        return file_path
+        
+    debug_dir = temp_dir / file_path.stem
+    debug_dir.mkdir(parents=True, exist_ok=True)
     
-    for file_path in files:
-        if file_path.suffix.lower() == ".pdf":
-            # PDF暂不走CV处理
-            processed_files.append(file_path)
-            continue
-            
-        img = cv2.imread(str(file_path))
-        if img is None:
-            processed_files.append(file_path)
-            continue
-            
-        # 为当前图片创建专属调试目录
-        debug_dir = temp_dir / file_path.stem
-        debug_dir.mkdir(parents=True, exist_ok=True)
-        
-        # -------------------------------------------------------------
-        # 基础画面预处理流水线 (细分步骤供 Debug)
-        # -------------------------------------------------------------
-        current_img = img.copy()
-        cv2.imwrite(str(debug_dir / "step0_original.jpg"), current_img)
+    current_img = img.copy()
+    cv2.imwrite(str(debug_dir / "step0_original.jpg"), current_img)
 
-        # Step 1: 仅图像锐化 (Unsharp Masking)
-        # 提升文字清晰度，对抗相机的轻微失焦，移除可能引起失真的对比度增强
-        gaussian = cv2.GaussianBlur(current_img, (0, 0), 2.0)
-        sharpened = cv2.addWeighted(current_img, 1.5, gaussian, -0.5, 0)
-        cv2.imwrite(str(debug_dir / "step1_sharpened.jpg"), sharpened)
-        
-        # 将锐化后的图作为主图
-        current_img = sharpened
+    gaussian = cv2.GaussianBlur(current_img, (0, 0), 2.0)
+    sharpened = cv2.addWeighted(current_img, 1.5, gaussian, -0.5, 0)
+    cv2.imwrite(str(debug_dir / "step1_sharpened.jpg"), sharpened)
+    
+    current_img = sharpened
 
-        # -------------------------------------------------------------
-        # Step 2: 提取灰度图
-        # -------------------------------------------------------------
-        gray = cv2.cvtColor(current_img, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(str(debug_dir / "step2_gray.jpg"), gray)
+    gray = cv2.cvtColor(current_img, cv2.COLOR_BGR2GRAY)
+    cv2.imwrite(str(debug_dir / "step2_gray.jpg"), gray)
+    
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    cv2.imwrite(str(debug_dir / "step3_thresh.jpg"), thresh)
+    
+    contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if len(contours) > 0:
+        max_contour = max(contours, key=cv2.contourArea)
+        max_area = cv2.contourArea(max_contour)
+        img_area = current_img.shape[0] * current_img.shape[1]
         
-        # -------------------------------------------------------------
-        # Step 3: 全局大津法二值化 (直接寻找文档亮区)
-        # -------------------------------------------------------------
-        # 根据需求：无高斯模糊，直接二值化，将明亮的屏幕页面与暗色的屏幕边框剥离
-        _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
-        cv2.imwrite(str(debug_dir / "step3_thresh.jpg"), thresh)
-        
-        # -------------------------------------------------------------
-        # Step 4: 寻找最大亮区并裁剪边缘
-        # -------------------------------------------------------------
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if len(contours) > 0:
-            # 找到面积最大的轮廓，即文档主体区域
-            max_contour = max(contours, key=cv2.contourArea)
-            max_area = cv2.contourArea(max_contour)
-            img_area = current_img.shape[0] * current_img.shape[1]
-            
-            # 最大轮廓需大于一定比例，防止误切
-            if max_area > img_area * 0.1:
-                x, y, w, h = cv2.boundingRect(max_contour)
-                
-                # 仅裁切左右边缘，保留上下边缘 (根据要求取消了上下裁切)
-                margin_x = 5
-                x_min = max(0, x - margin_x)
-                x_max = min(gray.shape[1], x + w + margin_x)
-                
-                final_img = gray[:, x_min:x_max]
-            else:
-                final_img = gray
+        if max_area > img_area * 0.1:
+            x, y, w, h = cv2.boundingRect(max_contour)
+            margin_x = 5
+            x_min = max(0, x - margin_x)
+            x_max = min(gray.shape[1], x + w + margin_x)
+            final_img = gray[:, x_min:x_max]
         else:
             final_img = gray
-            
-        cv2.imwrite(str(debug_dir / "step5_final_cropped.jpg"), final_img)
+    else:
+        final_img = gray
         
-        # 为了防止后续 OCR 输出目录冲突，将最终送去 OCR 的图片以原文件名保存在 temp_dir 根目录下
-        final_ocr_input = temp_dir / file_path.name
-        cv2.imwrite(str(final_ocr_input), final_img)
-        
-        # 打印调试信息
-        print(f"    [OpenCV] {file_path.name} 流水线处理完毕，调试图保存于: {debug_dir}")
-        
-        processed_files.append(final_ocr_input)
-        
-    return processed_files
+    cv2.imwrite(str(debug_dir / "step5_final_cropped.jpg"), final_img)
+    
+    final_ocr_input = temp_dir / file_path.name
+    cv2.imwrite(str(final_ocr_input), final_img)
+    
+    return final_ocr_input
 
 
 # =============================================================================
@@ -902,8 +762,7 @@ def preprocess_images_with_opencv(files: list, temp_dir: Path) -> list:
 
 def main():
     print("=" * 70)
-    print("  PaddleOCR-VL-1.6 批处理系统 — PPLayout 版面分析 + OCR")
-    print(f"  时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("  Qwen-VL 批处理系统 — 纯 OCR (全局并发版)")
     print("=" * 70)
 
     # 加载配置
@@ -929,35 +788,10 @@ def main():
         print("[FATAL] 无法连接 vLLM Server, 退出")
         sys.exit(1)
 
-    ocr_backend = config.get("ocr", {}).get("backend", "qwen-vl")
-    
-    if ocr_backend == "paddleocr-vl":
-        # 使用 ThreadLocal 管理 PaddleOCR-VL Pipeline，避免 C++ 并发底层报错 (double free)
-        print(f"\n[INFO] 配置 PaddleOCR-VL-1.6 Pipeline (延迟到每个线程独立初始化)...")
-        print(f"[INFO] VLM 推理后端: vLLM Server @ {server_url}")
-        
-        import threading
-        thread_local = threading.local()
+    ocr_backend = "qwen-vl"
+    print(f"\n[INFO] 使用 {ocr_backend} 作为 OCR 后端")
 
-        def get_thread_local_pipeline():
-            if not hasattr(thread_local, "pipeline"):
-                from paddleocr import PaddleOCRVL
-                thread_local.pipeline = PaddleOCRVL(
-                    pipeline_version="v1.6",
-                    vl_rec_backend="vllm-server",
-                    vl_rec_server_url=server_url,
-                )
-                print(f"    [Thread-{threading.get_ident()}] Pipeline 初始化完成")
-            return thread_local.pipeline
-
-    else:
-        print(f"\n[INFO] 使用 {ocr_backend} 作为 OCR 后端")
-        thread_local = None
-        
-        def get_thread_local_pipeline():
-            return None
-
-    # 同时初始化 OpenAI 客户端（用于后续的结构化提取，如果需要的话）
+    # 同时初始化 OpenAI 客户端
     client = create_client(server_url)
     model_name = get_model_name(client)
 
@@ -970,101 +804,158 @@ def main():
     total_files = sum(len(files) for files in grouped_files.values())
     print(f"\n[INFO] 找到 {len(grouped_files)} 个分组，共 {total_files} 个待处理文件")
 
-    total_success = 0
-    total_error = 0
+    import concurrent.futures
+    import threading
 
-    # 外层循环：遍历所有病人/分组
+    # 自动满载调度系统
+    extraction_workers = 3
+    server_max_seqs = int(os.environ.get("MAX_NUM_SEQS", 16))
+    ocr_workers = max(1, server_max_seqs - extraction_workers)
+    
+    print(f"\n[系统] 动态满载调度开启: 服务器总容量={server_max_seqs}")
+    print(f"  -> 阶段一 (混合): OCR 并发={ocr_workers}, JSON 并发限制={extraction_workers}")
+    print(f"  -> 阶段二 (纯享): OCR 结束后, JSON 并发将自动扩容至={server_max_seqs}")
+    
+    # JSON 并发节流阀 (在 OCR 运行期间，严格限制 JSON 的并发数)
+    extraction_semaphore = threading.Semaphore(extraction_workers)
+    
+    # 1. 初始化全局线程池 (JSON 线程池的物理线程数直接开满，但受到 semaphore 逻辑限制)
+    ocr_executor = concurrent.futures.ThreadPoolExecutor(max_workers=ocr_workers)
+    extraction_executor = concurrent.futures.ThreadPoolExecutor(max_workers=server_max_seqs)
+
+    # 带有节流阀的后台提取任务包装器
+    def extraction_task_with_semaphore(*args):
+        with extraction_semaphore:
+            with active_tasks["lock"]:
+                active_tasks["json"] += 1
+            try:
+                merge_results(*args)
+            finally:
+                with active_tasks["lock"]:
+                    active_tasks["json"] -= 1
+
+    # 2. 初始化全局进度追踪器
+    group_tracker = {}
+    
+    # 全局统计与实时在途任务追踪
+    global_stats = {"success": 0, "error": 0, "lock": threading.Lock()}
+    active_tasks = {"ocr": 0, "json": 0, "lock": threading.Lock()}
+    
+    # 3. 准备所有的任务
+    print(f"\n{'-'*60}")
+    print(f"[INFO] 启动全局流水线并发处理 (包含 OpenCV 预处理 + OCR)")
+    print(f"{'-'*60}")
+
     for group_name, files in grouped_files.items():
-        print(f"\n{'='*70}")
-        print(f"  开始处理分组: {group_name} (包含 {len(files)} 个文件)")
-        print(f"{'='*70}")
-        
-        # 为当前分组分配特定的输出目录
         group_output_dir = output_dir / group_name
         group_processed_dir = processed_dir / group_name
         temp_dir = Path(input_dir) / ".tmp_cv2" / group_name
-
-        # Step 1: OpenCV 图像预处理（裁边、灰度化等）
-        print(f"\n[INFO] 启动 OpenCV 图像预处理...")
-        processed_files = preprocess_images_with_opencv(files, temp_dir)
-
-        # Step 2: 并发 OCR 处理
-        results = []
-        success_count = 0
-        error_count = 0
-
-        import concurrent.futures
-
-        max_workers = processing.get("max_workers", 4)
-        print(f"\n{'-'*60}")
-        print(f"[INFO] 启动并发 OCR 处理 (最大并发数: {max_workers}, 后端: {ocr_backend})")
-        print(f"{'-'*60}")
-
-        # 使用线程池并发处理当前分组的文件
-        def _process_wrapper(args):
-            idx, total, orig_file, cv2_file = args
-            print(f"\n[{idx}/{total}] 开始处理: {orig_file.name}")
+        
+        # 提前清理临时文件夹
+        import shutil
+        if temp_dir.exists():
+            shutil.rmtree(str(temp_dir))
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        group_tracker[group_name] = {
+            "total": len(files),
+            "completed": 0,
+            "results": [],
+            "lock": threading.Lock(),
+            "group_output_dir": group_output_dir,
+            "group_processed_dir": group_processed_dir,
+            "temp_dir": temp_dir
+        }
+        
+    def _process_wrapper(orig_file, temp_dir, group_output_dir):
+        with active_tasks["lock"]:
+            active_tasks["ocr"] += 1
+        try:
+            # 流水线阶段 1: CPU 本地计算 OpenCV 图像预处理
+            cv2_file = preprocess_single_image(orig_file, temp_dir)
             
-            if ocr_backend == "paddleocr-vl":
-                # 获取当前线程专属的 pipeline 实例，避免 C++ 并发报错
-                local_pipeline = get_thread_local_pipeline()
-                res = process_single_file_paddleocr(
-                    local_pipeline, cv2_file, group_output_dir, config
-                )
-
-            else:
-                res = process_single_file_qwen(
-                    client, model_name, cv2_file, group_output_dir, config
-                )
-                
+            # 流水线阶段 2: 组装网络请求发送到 GPU vLLM
+            res = process_single_file_qwen(
+                client, model_name, cv2_file, group_output_dir, config
+            )
             res["file"] = orig_file.name
             return orig_file, res
+        finally:
+            with active_tasks["lock"]:
+                active_tasks["ocr"] -= 1
 
-        tasks_args = [
-            (idx, len(files), orig_file, cv2_file) 
-            for idx, (orig_file, cv2_file) in enumerate(zip(sorted(files), processed_files), 1)
-        ]
+    all_ocr_futures = []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_file = {
-                executor.submit(_process_wrapper, args): args[2] 
-                for args in tasks_args
-            }
+    # 无差别倾倒所有任务到全局线程池
+    for group_name, files in grouped_files.items():
+        tracker = group_tracker[group_name]
+        for orig_file in sorted(files):
+            future = ocr_executor.submit(_process_wrapper, orig_file, tracker["temp_dir"], tracker["group_output_dir"])
             
-            for future in concurrent.futures.as_completed(future_to_file):
-                orig_file = future_to_file[future]
-                try:
-                    _, result = future.result()
-                    results.append(result)
-                    
-                    if result["status"] == "success":
-                        success_count += 1
-                        if archive_processed:
-                            archive_file(orig_file, group_processed_dir)
-                    else:
-                        error_count += 1
-                except Exception as exc:
-                    print(f"[ERROR] {orig_file.name} 并发处理时抛出异常: {exc}")
-                    error_count += 1
+            # 使用闭包绑定当前组名
+            def make_callback(g_name):
+                def callback(f):
+                    try:
+                        orig_f, res = f.result()
+                    except Exception as exc:
+                        print(f"[ERROR] 发生致命并发异常: {exc}")
+                        return
+                        
+                    t = group_tracker[g_name]
+                    with t["lock"]:
+                        t["results"].append(res)
+                        t["completed"] += 1
+                        
+                        # 局部打印
+                        if res["status"] == "success":
+                            with global_stats["lock"]:
+                                global_stats["success"] += 1
+                            with active_tasks["lock"]:
+                                cur_ocr = active_tasks["ocr"]
+                                cur_json = active_tasks["json"]
+                            print(f"[OCR] [{t['completed']}/{t['total']}] {g_name} - {orig_f.name} 完成 ({res['elapsed_seconds']}s) [当前 GPU 满载实况: {cur_ocr} OCR, {cur_json} JSON]")
+                            if archive_processed:
+                                archive_file(orig_f, t["group_processed_dir"])
+                        else:
+                            with global_stats["lock"]:
+                                global_stats["error"] += 1
+                            print(f"[OCR] ❌ {g_name} - {orig_f.name} 失败")
 
-        total_success += success_count
-        total_error += error_count
+                        # 检查当前组是否全部完成
+                        if t["completed"] == t["total"]:
+                            print(f"\n[INFO] {g_name} 所有图片 OCR 处理完毕。")
+                            if merge_output and t["results"]:
+                                results = t["results"]
+                                results.sort(key=lambda x: x.get("file", ""))
+                                # 丢入后台 JSON 抽取队列 (受节流阀控制)
+                                extraction_executor.submit(
+                                    extraction_task_with_semaphore, client, model_name, config, t["group_output_dir"], results, output_formats
+                                )
+                return callback
+                
+            future.add_done_callback(make_callback(group_name))
+            all_ocr_futures.append(future)
 
-        # 合并结果与全局抽取 (阶段二: 结构化抽取)
-        if merge_output and results:
-            print(f"\n{'-'*60}")
-            print(f"[MERGE] {group_name}: 汇总结果并执行独立结构化抽取...")
-            
-            # 由于并发执行返回顺序不确定，必须按文件名重新排序，保证病历页码连续性
-            results.sort(key=lambda x: x.get("file", ""))
-            
-            merge_results(client, model_name, config, group_output_dir, results, output_formats)
-            
-        print(f"\n[INFO] {group_name} 分组处理完成，调试图像保存在 {temp_dir} 下。")
+    # 4. 阻塞等待所有任务收尾
+    # 等待所有的 OCR 任务执行完毕
+    ocr_executor.shutdown(wait=True)
+    
+    print(f"\n{'='*70}")
+    print(f"[INFO] 所有 OCR 流水线已收工！释放算力节流阀，JSON 长文本抽取火力全开 (并发提升至 {server_max_seqs})...")
+    print(f"{'='*70}")
+    
+    # 释放所有被保留给 OCR 的并发额度，让积压的 JSON 任务抢占全部显卡算力
+    for _ in range(server_max_seqs - extraction_workers):
+        extraction_semaphore.release()
+        
+    # 等待所有的 JSON 任务执行完毕
+    extraction_executor.shutdown(wait=True)
 
     # 最终报告
     print(f"\n{'='*70}")
-    print(f"  批处理完成!")
+    print(f"  全局批处理彻底完成!")
+    total_success = global_stats["success"]
+    total_error = global_stats["error"]
     print(f"  成功: {total_success} / {total_success + total_error}")
     print(f"  失败: {total_error} / {total_success + total_error}")
     print(f"  输出: {output_dir}")
@@ -1072,7 +963,6 @@ def main():
 
     if total_error > 0:
         sys.exit(1)
-
 
 if __name__ == "__main__":
     main()

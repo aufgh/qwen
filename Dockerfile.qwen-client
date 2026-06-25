@@ -1,25 +1,23 @@
 # =============================================================================
-# Qwen Client Container — PaddleOCR-VL-1.6 + PPLayout 版
+# Qwen Client Container
 # 模型权重、脚本、配置均通过 volume mount 挂载
 # 离线可用：所有 pip 包在构建时安装
 # =============================================================================
 
 FROM python:3.10-slim
 
-# 系统依赖 (图像处理、PDF 渲染、网络工具)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    libgomp1 \
+# 替换为国内镜像源 (清华大学) 加速 apt 下载，并立即安装依赖以防止缓存失效
+RUN sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
+    sed -i 's/deb.debian.org/mirrors.tuna.tsinghua.edu.cn/g' /etc/apt/sources.list 2>/dev/null || true && \
+    sed -i 's|security.debian.org/debian-security|mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list.d/debian.sources 2>/dev/null || true && \
+    sed -i 's|security.debian.org/debian-security|mirrors.tuna.tsinghua.edu.cn/debian-security|g' /etc/apt/sources.list 2>/dev/null || true && \
+    apt-get update && apt-get install -y --no-install-recommends \
     curl \
     poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
-# Python 基础依赖 (保留原有依赖)
-RUN pip install --no-cache-dir \
+# Python 基础依赖 (使用国内 pip 镜像源)
+RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ \
     openai \
     pyyaml \
     watchdog \
@@ -30,11 +28,6 @@ RUN pip install --no-cache-dir \
     tqdm \
     opencv-python-headless \
     numpy
-
-# PaddlePaddle + PaddleOCR SDK (PPLayout 版面分析 + VLM 编排)
-# 注：使用 CPU 版 PaddlePaddle 即可（版面分析用 CPU, VLM 推理由 vLLM 容器的 GPU 负责）
-RUN pip install --no-cache-dir paddlepaddle==3.2.1
-RUN pip install --no-cache-dir "paddleocr[doc-parser]>=3.6.0"
 
 WORKDIR /workspace
 

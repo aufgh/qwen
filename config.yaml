@@ -17,7 +17,7 @@ model:
 # top_k:              (默认20) 只有在 temperature > 0 时才生效。限制备选词汇池的大小。
 # min_p:              (默认0.0) 丢弃概率低于该阈值的生僻词。
 # presence_penalty:   (默认0.0) 存在惩罚。>0 会鼓励模型尝试新的话题。OCR 不需要修改。
-# repetition_penalty: (默认1.0) 重复惩罚。1.0 代表不惩罚。如果发现模型一直在复读同一句话，
+# repetition_penalty: (默认1.15) 重复惩罚。1.0 代表不惩罚。如果发现模型一直在复读同一句话，
 #                     可以稍微调高（如 1.05 或 1.1）。
 # -----------------------------------------------------------------------------
 inference:
@@ -27,12 +27,12 @@ inference:
   top_k: 50
   min_p: 0.0
   presence_penalty: 0.0
-  repetition_penalty: 1.0
+  repetition_penalty: 1.15
   thinking_enabled: false      # 关闭 thinking 模式以节省 token
 
 # 处理配置
 processing:
-  max_workers: 2                # 客户端并发请求数 (需与后端的 max-num-seqs 匹配，8GB 显卡建议为 2)
+  max_workers: 8                # 客户端并发请求数 (与模型承载力及显存大小相关)
   output_formats:               # 输出格式列表: markdown, json
     - markdown
     - json
@@ -49,10 +49,8 @@ processing:
     - .pdf
 
 # OCR 识别配置
-# 注：PaddleOCR-VL-1.6 使用内置的专用 OCR 触发词（如 "OCR:"），
-# 以下自定义 Prompt 仅在切回 Qwen3.5 模式时生效。
 ocr:
-  backend: "qwen-vl"           # 当前使用的 OCR 后端: paddleocr-vl | qwen-vl
+  backend: "qwen-vl"           # 当前使用的 OCR 后端: qwen-vl
   system_prompt: |
     你是一个专业的医疗文档 OCR 识别助手。
     你的任务是精确地将图片中的文字转化为文本，为后续的结构化提取提供完美的语料。

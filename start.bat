@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 setlocal enabledelayedexpansion
 title Qwen3.5-4B 高并发 OCR + JSON 抽取处理管线
 
@@ -29,11 +30,7 @@ echo [2/4] 正在启动 vLLM 大模型推理引擎...
 
 docker compose up -d vllm-server >nul 2>&1
 
-:: 弹出一个独立窗口，专门用来实时滚动查看 vLLM 的抢占警告和底层日志
-start cmd /k "title vLLM Server Logs && echo 正在实时追踪 vLLM 引擎后台日志... && echo 如遇 [Preemption] 抢占警告，请到 .env 调低 MAX_NUM_SEQS && echo ================================================================ && docker logs -f qwen-vllm-server"
-
 echo       vLLM 引擎已在后台启动。
-echo       (已为您弹出独立日志窗口，可以实时观察大模型的显存占用和加载进度)
 echo.
 
 :: ----------------------------------------------------------
