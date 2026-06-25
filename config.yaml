@@ -58,58 +58,98 @@ ocr:
 
 # 结构化 JSON 提取配置
 extraction:
-  enabled: true                  # 是否启用结构化提取 (暂时关闭，专注 OCR)
+  enabled: true
+
   system_prompt: |
-    请根据以下 schema 提取信息，并以严格的 JSON 格式输出。
-    【核心任务】：你是一个专业的结构化病历提取专家，需要从杂乱的 OCR 文本中提取关键病历特征。
-    【重要规则 - 模板式提取与细粒度溯源 (Grounding)】：
-    你的提取过程必须像填空题一样，严格按照给定的 JSON Template 骨架进行填充。
-    由于输出长度限制，你绝对不能摘抄原话！
-    提供给你的原文已经按短句和标点打上了编号（如 [0], [1]...）。
-    每一项被提取的数据，必须使用包含 `value` 和 `evidence_id` 两个字段的对象来表示。
-    - `value`：你对该字段提取出的总结内容或数值（严格遵照 Template 中要求的类型，如 string 或 boolean）。
-    - `evidence_id`：支撑该结论的最核心的原文句子编号（**必须是 integer 整数**，例如 5。如果有多个句子支撑，只输出最核心的一句的编号）。如果无提及，填 -1。
-    （注：后处理程序会根据你提供的编号，自动映射回完整的证据段落，所以你绝对不要自己输出文字证据！）
+    你是中文病历结构化抽取助手。严格按 schema_template 输出 JSON，不新增字段。
+
+    <病历原文>的每个短句或词组后面都已经注入了隐形的定位锚点（如 <s1>, <s2>...），请你在阅读时忽略它们，不要受其影响。
     
-    绝对禁止输出任何推理过程！只输出完整的 JSON 对象！直接从 { 开始输出！
+    schema_template 中：
+    T=原文截取型，输出 {"v":值或null,"p":"<sX>"或null}
+    J=异常判断型，输出 {"s":0|1|2,"p":"<sX>"或null}
+
+    s含义：0=正常，1=异常，2=未提及。
+    p含义：支撑你得出该结论的最核心原文片段末尾的**锚点标签**（例如 "<s5>"）。如果证据跨越多个短句，你可以输出一个数组，例如 ["<s5>", "<s6>"]。
+    T字段未提及时：v=null,p=null。
+    J字段正常或未提及时：p=null；只有异常时填写p。
+    绝对不要输出证据原文内容，绝对不要输出Markdown或推理过程，直接输出纯粹的严格JSON格式。
+
   user_prompt_template: |
-    <|input|>
-    ### Template:
+    schema_template:
     {schema_template}
 
-    ### Text:
+    <病历原文>
     {text}
-    
-    <|output|>
-  # JSON Schema 定义 — 按照《结构化字段.docx》重新规划
-  schema:
-    - field: "chief_complaint"
-      type: "object"
-      description: "主诉。"
-    - field: "history_of_present_illness"
-      type: "object"
-      description: "现病史。必须提取为包含多个具体键的对象，如：初次发病情况, 后续发病情况, 院内诊断情况, 近期症状, 精神, 大便情况, 小便情况, 体重变化。这些键的值都是包含 value, evidence_id 的对象。"
-    - field: "past_medical_history"
-      type: "object"
-      description: "既往史。包括但不限于心脏病、高血压、糖尿病、乙肝、便血、肾炎、血液病、冠心病、脑梗塞、手术史、输血史、血制品史、过敏史等。将原文提到的每一项既往病史作为独立的键，值为包含 value, evidence_id 的对象。"
-    - field: "personal_history"
-      type: "object"
-      description: "个人史。包含工作、吸烟史、饮酒史等。将原文提到的各项个人史作为独立的键，值为包含 value, evidence_id 的对象。"
-    - field: "family_history"
-      type: "object"
-      description: "家族史。提取关于家族中相关疾病历史的信息，值为包含 value, evidence_id 的对象。"
-    - field: "physical_examination"
-      type: "object"
-      description: "体格检查。包括生命体征(体温/脉搏/呼吸/血压/身高/体重/BMI)，以及异常的专科查体(皮肤/眼部/耳部/鼻部/口腔/颈部/胸部/乳房/呼吸/心律/腹部/四肢/神经)。提取原文中明确指出的体征，将其作为键，值为包含 value, evidence_id 的对象。"
-    - field: "ancillary_tests"
-      type: "object"
-      description: "辅助检查。包括但不限于胸部CT、心脏超声、血气、血常规、电解质、肾功、D2聚体等。提取各项检查结论作为键，值为包含 value, evidence_id 的对象。"
-    - field: "preliminary_diagnosis"
-      type: "object"
-      description: "初步诊断。"
-    - field: "final_diagnosis"
-      type: "object"
-      description: "最终诊断。"
+    </病历原文>
+
+    JSON:
+
+  schema_template:
+    主诉: T
+
+    现病史:
+      初次发病情况: T
+      后续发病情况: T
+      院内诊断情况: T
+      治疗药物: T
+      近期症状: T
+      精神睡眠食欲: J
+      大便情况: T
+      小便情况: J
+      体重变化: T
+
+    既往史:
+      心脏病: T
+      高血压: T
+      糖尿病: T
+      乙肝: J
+      便血: T
+      肾炎: J
+      血液病: J
+      冠心病: T
+      脑梗塞: T
+      手术史: J
+      输血史: J
+      血制品史: J
+      过敏史: J
+
+    个人史:
+      工作: T
+      吸烟史: T
+      饮酒史: T
+
+    家族史: T
+
+    体格检查:
+      生命体征: T
+      身高体重BMI: T
+      皮肤: J
+      眼部: J
+      耳部: J
+      鼻部: J
+      口腔: J
+      颈部: J
+      胸部: T
+      呼吸: T
+      心律: T
+      腹部: J
+      四肢: J
+      神经: J
+
+    辅助检查:
+      胸部CT: T
+      心脏超声: T
+      血气: T
+      CRP: T
+      血常规: T
+      电解质: J
+      肾功: J
+      D2聚体: J
+
+    初步诊断: T
+    最终诊断: T
+
 
 # 增量监控配置
 monitor:

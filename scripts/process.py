@@ -199,6 +199,77 @@ def ocr_image(
     return response.choices[0].message.content
 
 
+def build_schema_template(extraction: dict) -> str:
+    """构建压缩版中文抽取模板。
+
+    从 config.yaml 的 extraction.schema_template 读取模板。
+    模板中的 T/J 是给模型看的压缩字段类型。
+    """
+    schema_template = extraction.get("schema_template")
+    if schema_template is None:
+        raise ValueError("缺少 extraction.schema_template 配置")
+
+    return json.dumps(schema_template, ensure_ascii=False, indent=2)
+
+
+def restore_evidence(position, anchor_map: dict) -> str | None:
+    """把模型输出的锚点标签（如 <s1> 或 ["<s1>", "<s2>"]）还原为原文证据片段。"""
+    if not position:
+        return None
+    
+    if isinstance(position, str):
+        return anchor_map.get(position)
+        
+    if isinstance(position, list):
+        evidences = [anchor_map.get(str(p)) for p in position if str(p) in anchor_map]
+        return "".join(evidences) if evidences else None
+        
+    return None
+
+
+def restore_compact_output(data, anchor_map: dict):
+    """把模型输出的压缩格式还原为中文结构化 JSON。"""
+    status_map = {
+        0: "正常",
+        1: "异常",
+        2: "未提及",
+        "0": "正常",
+        "1": "异常",
+        "2": "未提及",
+    }
+
+    if isinstance(data, dict):
+        keys = set(data.keys())
+
+        # T 类型叶子节点：原文截取型
+        if keys.issubset({"v", "p"}) and "v" in data:
+            return {
+                "值": data.get("v"),
+                "证据": restore_evidence(data.get("p"), anchor_map),
+            }
+
+        # J 类型叶子节点：异常判断型
+        if keys.issubset({"s", "p"}) and "s" in data:
+            return {
+                "状态": status_map.get(data.get("s"), "未提及"),
+                "异常证据": restore_evidence(data.get("p"), anchor_map),
+            }
+
+        # 普通嵌套对象
+        return {
+            key: restore_compact_output(value, anchor_map)
+            for key, value in data.items()
+        }
+
+    if isinstance(data, list):
+        return [
+            restore_compact_output(item, anchor_map)
+            for item in data
+        ]
+
+    return data
+
+
 # =============================================================================
 # 结构化提取 (阶段二)
 # =============================================================================
@@ -219,42 +290,35 @@ def extract_structured(
     system_prompt = extraction.get("system_prompt", "从文本中提取结构化信息。")
     user_prompt_template = extraction.get("user_prompt_template", "请提取信息：\n{text}")
 
-    # 构建 Schema Template (NuExtract 风格)
-    schema_lines = []
-    for item in config.get("extraction", {}).get("schema", []):
-        field = item.get("field", "")
-        desc = item.get("description", "")
-        # 如果描述里暗示了多键对象（字典）
-        if "独立的键" in desc or "多个具体键" in desc or "作为键" in desc:
-            template_block = (
-                f'  "{field}": {{\n'
-                f'    "__instruction__": "{desc}",\n'
-                f'    "<填入动态识别的具体名称，例如：高血压>": {{\n'
-                f'      "value": "<string, 提取出的具体数值或状态>",\n'
-                f'      "evidence_id": <integer, 原文分句的数字编号>\n'
-                f'    }}\n'
-                f'  }}'
-            )
-        else:
-            template_block = (
-                f'  "{field}": {{\n'
-                f'    "__instruction__": "{desc}",\n'
-                f'    "value": "<string, 提取出的内容>",\n'
-                f'    "evidence_id": <integer, 原文分句的数字编号>\n'
-                f'  }}'
-            )
-        schema_lines.append(template_block)
-    schema_template = "{\n" + ",\n".join(schema_lines) + "\n}"
+    schema_template = build_schema_template(extraction)
 
-    # 分割句子，保留标点符号，采用逗号级超细粒度切分以提升 Grounding 准度
+    # 注入隐形锚点标记
     import re
-    parts = re.split(r'([。！？\n，,；;])', ocr_text)
-    sentences = ["".join(i).strip() for i in zip(parts[0::2], parts[1::2] + [""])]
-    sentences = [s for s in sentences if s]
+    parts = re.split(r'([。！？\n，,；;]+)', ocr_text)
     
-    # 构建带编号的文本
-    numbered_lines = [f"[{i}] {s}" for i, s in enumerate(sentences)]
-    numbered_text = "\n".join(numbered_lines)
+    anchored_text = ""
+    anchor_map = {}
+    anchor_idx = 1
+    current_chunk = ""
+    
+    for i in range(0, len(parts), 2):
+        chunk = parts[i]
+        punct = parts[i+1] if i+1 < len(parts) else ""
+        
+        current_chunk += chunk + punct
+        
+        if current_chunk.strip():
+            tag = f"<s{anchor_idx}>"
+            anchored_text += current_chunk + tag
+            # 去除可能的前后空格或换行作为纯净的证据
+            anchor_map[tag] = current_chunk.strip()
+            anchor_idx += 1
+            current_chunk = ""
+        else:
+            anchored_text += current_chunk
+            current_chunk = ""
+
+    numbered_text = anchored_text
 
     # 格式化 user prompt
     user_prompt = user_prompt_template.format(
@@ -310,31 +374,7 @@ def extract_structured(
 
         parsed_json = json.loads(json_str)
 
-        # [Grounding] 后处理溯源：根据 evidence_id 还原完整原文
-        def apply_grounding(data):
-            if isinstance(data, dict):
-                # 如果包含 evidence_id，执行精确替换
-                if "evidence_id" in data:
-                    try:
-                        eid = int(data["evidence_id"])
-                        if 0 <= eid < len(sentences):
-                            data["evidence"] = sentences[eid]
-                        else:
-                            data["evidence"] = f"【未定位 ID:{eid}】"
-                    except (ValueError, TypeError):
-                        data["evidence"] = "【ID格式错误或无证据】"
-                    
-                    data.pop("evidence_id", None)
-                    return
-                
-                # 递归遍历所有嵌套对象
-                for k, v in data.items():
-                    apply_grounding(v)
-            elif isinstance(data, list):
-                for item in data:
-                    apply_grounding(item)
-                    
-        apply_grounding(parsed_json)
+        parsed_json = restore_compact_output(parsed_json, anchor_map)
         return parsed_json
     except json.JSONDecodeError:
         print(f"[WARN] JSON 解析失败, 返回原始文本")
@@ -377,117 +417,6 @@ def scan_input_dir(input_dir: str, supported_ext: list) -> dict:
                 print(f"[WARN] 跳过不支持的文件: {item.name}")
 
     return grouped_files
-
-
-# =============================================================================
-# OpenCV 图像预处理管线
-# =============================================================================
-
-def preprocess_images_with_opencv(file_paths: list, temp_dir: Path) -> list:
-    """
-    对图片进行 OpenCV 预处理：
-    1. 灰度化
-    2. 高斯模糊降噪
-    3. 锐化
-    4. 寻找最大轮廓并裁切（去除边框/黑边）
-    5. 输出灰度裁切图像送入 OCR
-    返回预处理后的图像路径列表
-    """
-    import cv2
-    import numpy as np
-
-    processed_files = []
-
-    for file_path in file_paths:
-        file_path = Path(file_path)
-        
-        # 为每个文件创建调试目录
-        debug_dir = temp_dir / file_path.stem
-        debug_dir.mkdir(parents=True, exist_ok=True)
-
-        # 读取原始图像
-        img = cv2.imread(str(file_path))
-        if img is None:
-            print(f"    [WARN] 无法读取图像: {file_path.name}, 使用原始文件")
-            processed_files.append(file_path)
-            continue
-
-        # 保存原图到调试目录
-        cv2.imwrite(str(debug_dir / "0_original.jpg"), img)
-
-        # ----------------
-        # Step 1: 灰度化
-        # ----------------
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        cv2.imwrite(str(debug_dir / "1_gray.jpg"), gray)
-
-        # ----------------
-        # Step 2: 高斯模糊降噪
-        # ----------------
-        blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-        cv2.imwrite(str(debug_dir / "2_blurred.jpg"), blurred)
-
-        # ----------------
-        # Step 3: 锐化
-        # ----------------
-        sharpening_kernel = np.array([
-            [0, -1, 0],
-            [-1, 5, -1],
-            [0, -1, 0]
-        ], dtype=np.float32)
-        sharpened = cv2.filter2D(gray, -1, sharpening_kernel)
-        cv2.imwrite(str(debug_dir / "3_sharpened.jpg"), sharpened)
-
-        # ----------------
-        # Step 4: 自适应二值化用于轮廓检测
-        # ----------------
-        thresh = cv2.adaptiveThreshold(
-            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 11, 2
-        )
-        cv2.imwrite(str(debug_dir / "4_thresh.jpg"), thresh)
-
-        # ----------------
-        # Step 5: 寻找最大轮廓并裁切
-        # ----------------
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        current_img = sharpened  # 使用锐化后的灰度图
-        
-        if contours:
-            # 找到面积最大的轮廓
-            largest_contour = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest_contour)
-
-            # 如果轮廓面积占原图面积的比例大于 10%，才进行裁切
-            img_area = img.shape[0] * img.shape[1]
-            contour_area = w * h
-            
-            if contour_area / img_area > 0.10:
-                # 仅裁切左右边缘，保留上下边缘 (根据要求取消了上下裁切)
-                margin_x = 5
-                x_min = max(0, x - margin_x)
-                x_max = min(gray.shape[1], x + w + margin_x)
-                
-                # 使用灰度图进行裁切 (根据用户要求)
-                final_img = gray[:, x_min:x_max]
-            else:
-                final_img = gray  # 轮廓太小, 使用完整灰度图
-        else:
-            final_img = gray  # 没找到轮廓, 使用完整灰度图
-
-        cv2.imwrite(str(debug_dir / "5_final.jpg"), final_img)
-
-        # 为了防止后续 OCR 输出目录冲突，将最终送去 OCR 的图片以原文件名保存在 temp_dir 根目录下
-        final_ocr_input = temp_dir / file_path.name
-        cv2.imwrite(str(final_ocr_input), final_img)
-        
-        # 打印调试信息
-        print(f"    [OpenCV] {file_path.name} 流水线处理完毕，调试图保存于: {debug_dir}")
-        
-        processed_files.append(final_ocr_input)
-        
-    return processed_files
 
 
 
