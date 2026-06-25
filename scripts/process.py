@@ -311,8 +311,8 @@ def extract_structured(
 
     # 注入隐形锚点标记
     import re
-    # 增加对英文句号、中英文冒号、空格的切分，防止大段无标点文本（如诊断列表）没有锚点
-    parts = re.split(r'([。！？\n，,；;.:： ]+)', ocr_text)
+    # 增加对英文句号、中英文冒号的切分，防止大段无标点文本（如诊断列表）没有锚点，同时去掉空格切分以防标签过多
+    parts = re.split(r'([。！？\n，,；;.:：]+)', ocr_text)
     
     anchored_text = ""
     anchor_map = {}
