@@ -265,11 +265,11 @@ def restore_compact_output(data, anchor_map: dict):
                 "证据": restore_evidence(data.get("p"), anchor_map),
             }
 
-        # J 类型叶子节点：异常判断型
+        # J 类型叶子节点：状态判断型
         if keys.issubset({"s", "p"}) and "s" in data:
             return {
                 "状态": status_map.get(data.get("s"), "未提及"),
-                "异常证据": restore_evidence(data.get("p"), anchor_map),
+                "证据": restore_evidence(data.get("p"), anchor_map),
             }
 
         # 普通嵌套对象
@@ -327,8 +327,9 @@ def extract_structured(
         
         if current_chunk.strip():
             tag = f"<s{anchor_idx}>"
-            anchored_text += current_chunk + tag
-            # 去除可能的前后空格或换行作为纯净的证据
+            # 标签放在前面：<s1>内容
+            anchored_text += tag + current_chunk
+            # 纯净的证据依然是原内容
             anchor_map[tag] = current_chunk.strip()
             anchor_idx += 1
             current_chunk = ""
