@@ -466,13 +466,38 @@ def process_single_file_qwen(
     start_time = time.time()
 
     try:
-        ocr_text = ocr_image(client, model_name, str(file_path), config)
+        layout_config = config.get("layout_analysis", {})
+        
+        if layout_config.get("enabled", False):
+            # 版面分析模式：先检测区域 → 裁切子图 → 逐个 OCR → 按阅读顺序拼接
+            from layout_analyzer import analyze_layout, crop_regions
+            
+            regions = analyze_layout(
+                file_path,
+                min_score=layout_config.get("min_score", 0.5),
+                target_labels=layout_config.get("target_labels"),
+            )
+            
+            if len(regions) > 1:
+                # 有多个区域，裁切后逐个 OCR
+                layout_crop_dir = file_output_dir / "_layout_crops"
+                sub_images = crop_regions(file_path, regions, layout_crop_dir)
+                texts = []
+                for sub_img in sub_images:
+                    text = ocr_image(client, model_name, str(sub_img), config)
+                    if text and text.strip():
+                        texts.append(text.strip())
+                ocr_text = "\n\n".join(texts)
+            else:
+                # 只有一个区域或未检测到，走整图 OCR
+                ocr_text = ocr_image(client, model_name, str(file_path), config)
+        else:
+            # 未启用版面分析，走原有整图 OCR 逻辑
+            ocr_text = ocr_image(client, model_name, str(file_path), config)
 
-        # 保存结果
+        # 保存结果（纯净文本，不附加任何元数据）
         combined_ocr_path = file_output_dir / "ocr_result.md"
         with open(combined_ocr_path, "w", encoding="utf-8") as f:
-            f.write(f"# OCR 完整结果 - {file_path.name}\n\n")
-            f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n---\n\n")
             f.write(ocr_text)
             f.write("\n")
 
@@ -530,40 +555,30 @@ def merge_results(client: OpenAI, model_name: str, config: dict, output_dir: Pat
     if "markdown" in output_formats:
         merged_md = merged_dir / "merged_ocr.md"
         with open(merged_md, "w", encoding="utf-8") as f:
-            f.write(f"# Qwen3.5-4B 批量 OCR 汇总\n\n")
-            f.write(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            f.write(f"共处理 {len(results)} 个文件\n\n")
-            f.write("---\n\n")
-
-            for result in results:
-                f.write(f"## {result['file']}\n\n")
+            for i, result in enumerate(results):
                 if result["status"] == "error":
-                    f.write(f"**处理过程遇到错误**: {result.get('error', '未知错误')}\n\n")
-                    f.write(f"*尝试强制合并已生成的 OCR 结果...*\n\n")
+                    continue
 
                 file_dir = Path(result.get("output_dir", ""))
                 if file_dir.exists():
                     md_files = sorted(file_dir.glob("ocr_result.md"))
                     for md_file in md_files:
                         try:
-                            content = md_file.read_text(encoding="utf-8")
-                            combined_ocr_for_extraction.append(f"【来源文件: {result['file']}】\n{content}")
+                            content = md_file.read_text(encoding="utf-8").strip()
+                            combined_ocr_for_extraction.append(content)
                             f.write(content)
-                            f.write("\n\n")
+                            # 页与页之间只用一个空行分隔
+                            if i < len(results) - 1:
+                                f.write("\n\n")
                         except Exception as e:
-                            f.write(f"(读取失败: {e})\n\n")
-
-                f.write("---\n\n")
+                            print(f"[WARN] 读取 {md_file} 失败: {e}")
 
         print(f"[MERGE] 所有文本已汇总至: {merged_md}")
 
-        # 额外生成一个结构更干净的 txt 版本
+        # 额外生成一个结构更干净的 txt 版本（内容与 md 完全一致）
         merged_txt = merged_dir / "merged_ocr.txt"
         with open(merged_txt, "w", encoding="utf-8") as f_txt:
-            f_txt.write(f"合并时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-            for item in combined_ocr_for_extraction:
-                f_txt.write(item)
-                f_txt.write("\n\n========================================================================\n\n")
+            f_txt.write("\n\n".join(combined_ocr_for_extraction))
         print(f"[MERGE] 纯文本 txt 也已保存至: {merged_txt}")
 
     # 2. 对合并后的文本进行统一全局抽取

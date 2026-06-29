@@ -48,6 +48,18 @@ processing:
     - .tif
     - .pdf
 
+# 版面分析配置 (PP-DocLayoutV2)
+# 用于复杂排版（如双列）的切分。依赖 PaddlePaddle 和 PaddleOCR。
+layout_analysis:
+  enabled: true                  # 默认开启，自动裁切复杂排版
+  model_name: "PP-DocLayoutV2"
+  min_score: 0.5                 # 过滤低置信度区域
+  target_labels:                 # 提取哪些类型的区域
+    - text
+    - title
+    - table
+    - list
+
 # OCR 识别配置
 ocr:
   backend: "qwen-vl"           # 当前使用的 OCR 后端: qwen-vl

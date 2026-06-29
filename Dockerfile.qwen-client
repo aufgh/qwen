@@ -27,7 +27,9 @@ RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ \
     pdf2image \
     tqdm \
     opencv-python-headless \
-    numpy
+    numpy \
+    paddlepaddle \
+    "paddleocr[doc-parser]"
 
 WORKDIR /workspace
 
